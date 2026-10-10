@@ -108,6 +108,7 @@ class ResponseComposer:
         data: dict,
         routing: dict,
         safety: dict | None = None,
+        question: str = "",
     ) -> dict:
         """Compose answer and schema fields from triage, evidence, and routing."""
         safety_dict = safety if isinstance(safety, dict) else {
@@ -116,7 +117,8 @@ class ResponseComposer:
             "security_escalation": "No",
             "refusal_message": "",
         }
-        return _build_response_internal(triage, policy, data, routing, safety_dict)
+        req_q = question or safety_dict.get("cleaned_text") or ""
+        return _build_response_internal(triage, policy, data, routing, safety_dict, question=req_q)
 
 
 def build_response(
@@ -125,9 +127,110 @@ def build_response(
     data: dict,
     routing: dict,
     safety: dict | None = None,
+    question: str = "",
 ) -> dict:
     """Build a grounded answer and prediction-schema fields without generation."""
-    return ResponseComposer().compose(triage, policy, data, routing, safety)
+    return ResponseComposer().compose(triage, policy, data, routing, safety, question=question)
+
+
+def _generate_specific_answer(
+    question: str,
+    category: str,
+    priority: str,
+    policy_passages: list[dict],
+    data_answer: str,
+    safe_data_facts: list[str],
+    data_notes: str,
+    routing: dict,
+    escalated: str,
+    human_approval_required: str,
+) -> str:
+    """Generate a direct, specific, and actionable answer tailored to the user."""
+    # 1. Attempt LLM answer synthesis for fluent, specific answers
+    if question.strip():
+        try:
+            from llm_client import chat_completion
+
+            context_items = []
+            if data_answer:
+                context_items.append(f"Business Data Result: {data_answer}")
+            if safe_data_facts:
+                context_items.append("Confirmed Data Facts: " + "; ".join(safe_data_facts[:4]))
+            for passage in policy_passages[:2]:
+                text = passage.get("text", "").strip()
+                if text:
+                    context_items.append(f"Policy Reference ({passage.get('heading', '')}):\n{text}")
+            if human_approval_required == "Yes":
+                context_items.append("Approval rule: Store Manager approval is strictly required before any action.")
+            team = routing.get("escalation_team")
+            if escalated == "Yes" and team:
+                context_items.append(f"Escalation team: {team}")
+
+            if context_items:
+                prompt_messages = [
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are an AI-powered Retail Operations Copilot. Give a direct, specific, and actionable answer "
+                            "to the employee's exact question, based strictly on the provided policy, data findings, and routing. "
+                            "Address the specific store, register, error code, product, or scenario in the question. "
+                            "Do NOT include generic prefixes (such as 'Category:', 'Priority:', 'Policy guidance:', 'Data result:'). "
+                            "Do NOT include generic boilerplate disclaimers (such as 'Recommendations only; no refund...'). "
+                            "Answer directly, concisely, and professionally (2-4 sentences)."
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": f"Employee Question: {question}\n\nEvidence & Policy Context:\n" + "\n\n".join(context_items),
+                    },
+                ]
+                llm_res = chat_completion(prompt_messages, temperature=0.0, timeout=12.0, max_retries=1)
+                content = llm_res.get("content", "").strip()
+                if content:
+                    return _safe_text(content)
+        except Exception:
+            pass
+
+    # 2. Specific deterministic fallback (free of generic boilerplate prefixes)
+    specific_parts = []
+    if data_answer:
+        specific_parts.append(data_answer)
+    elif safe_data_facts:
+        specific_parts.append("; ".join(safe_data_facts[:3]) + ".")
+
+    if data_notes and data_notes not in " ".join(specific_parts):
+        specific_parts.append(data_notes)
+
+    # Extract actionable policy sentences rather than whole documents
+    for passage in policy_passages[:2]:
+        text = passage.get("text", "")
+        action_lines = []
+        for line in text.splitlines():
+            cleaned = line.strip()
+            if not cleaned or cleaned.startswith(("#", "Source ID:", "Applies to:")):
+                continue
+            if cleaned.startswith(("-", "*", "1.", "2.", "3.", "4.")):
+                action_lines.append(cleaned.lstrip("-*1234. "))
+            elif any(verb in cleaned.casefold() for verb in ("re-seat", "restart", "check", "verify", "ticket", "escalate", "approval", "quarantine")):
+                action_lines.append(cleaned)
+        if action_lines:
+            specific_parts.append(". ".join(action_lines[:2]) + ".")
+        else:
+            first_sent = _first_policy_sentence(passage)
+            if first_sent and first_sent not in " ".join(specific_parts):
+                specific_parts.append(first_sent)
+
+    if human_approval_required == "Yes" and "approval" not in " ".join(specific_parts).casefold():
+        specific_parts.append("Store Manager approval is required before taking action.")
+
+    team = routing.get("escalation_team")
+    if escalated == "Yes" and team and team not in " ".join(specific_parts):
+        specific_parts.append(f"Route to {team}.")
+
+    if not specific_parts:
+        return "I could not confirm specific policy or data guidance for this issue. A store manager should review it."
+
+    return _safe_text(" ".join(specific_parts))
 
 
 def _build_response_internal(
@@ -136,6 +239,7 @@ def _build_response_internal(
     data: dict,
     routing: dict,
     safety: dict,
+    question: str = "",
 ) -> dict:
 
     confidence, category, priority = _validate_inputs(triage, policy, data, routing, safety)
@@ -147,7 +251,7 @@ def _build_response_internal(
     priority = routed_priority
 
     citations = []
-    policy_sentences = []
+    valid_passages = []
     rejected_citation = False
     for passage in policy.get("passages", []):
         if not isinstance(passage, dict):
@@ -159,9 +263,7 @@ def _build_response_internal(
             continue
         if citation not in citations:
             citations.append(citation)
-        sentence = _first_policy_sentence(passage)
-        if sentence and sentence not in policy_sentences:
-            policy_sentences.append(sentence)
+        valid_passages.append(passage)
 
     safe_data_facts = [_safe_text(fact) for fact in data.get("facts", []) if isinstance(fact, str)]
     safe_data_facts = [fact for fact in safe_data_facts if fact]
@@ -199,56 +301,27 @@ def _build_response_internal(
         else "No"
     )
 
-    answer_parts = []
     if safety_refusal or security_escalation:
         refusal = _safe_text(safety.get("refusal_message", ""))
-        answer_parts.append(
+        answer = (
             refusal
             or "I can’t provide restricted information. Use an approved, access-controlled process."
         )
     else:
-        answer_parts.append(f"Category: {category}. Priority: {priority}.")
+        # Generate specific answer addressing ONLY the user's question without generic boilerplates
+        answer = _generate_specific_answer(
+            question=question,
+            category=category,
+            priority=priority,
+            policy_passages=valid_passages,
+            data_answer=data_answer,
+            safe_data_facts=safe_data_facts,
+            data_notes=data_notes,
+            routing=routing,
+            escalated=escalated,
+            human_approval_required=human_approval_required,
+        )
 
-        # Facts are copied from local calculations; no new numbers are created here.
-        if data_answer:
-            answer_parts.append("Data result: " + data_answer)
-        if safe_data_facts:
-            answer_parts.append("Confirmed facts: " + "; ".join(safe_data_facts[:5]) + ".")
-
-        for sentence in policy_sentences[:2]:
-            answer_parts.append("Policy guidance: " + sentence)
-
-        if not policy_sentences and not safe_data_facts and not data_answer:
-            answer_parts.append("I could not confirm an answer from the supplied policy or data files.")
-
-        if data_notes:
-            # The note is explicitly labeled as unconfirmed when it suggests a cause.
-            possible_cause = any(
-                phrase in data_notes.casefold()
-                for phrase in ("possible", "likely", "cause", "should be reviewed", "signal for review")
-            )
-            prefix = "Possible cause or next check (not confirmed): " if possible_cause else "Data note: "
-            answer_parts.append(prefix + data_notes)
-
-    if not route_found:
-        answer_parts.append("Routing information is unavailable; a human must review this case.")
-    else:
-        team = _safe_text(routing.get("escalation_team", ""))
-        channel = _safe_text(routing.get("channel", ""))
-        sla_minutes = routing.get("sla_minutes")
-        if escalated == "Yes" and team:
-            route_text = f"Escalation route: {team}"
-            if channel:
-                route_text += f" via {channel}"
-            if isinstance(sla_minutes, int) and not isinstance(sla_minutes, bool):
-                route_text += f" (SLA {sla_minutes} minutes)"
-            answer_parts.append(route_text + ".")
-
-    if human_approval_required == "Yes":
-        answer_parts.append("Human approval is required before any action is taken.")
-    answer_parts.append("Recommendations only; no refund, inventory change, or vendor action has been executed.")
-
-    answer = _safe_text(" ".join(answer_parts))
     if re.search(r"\*+|\[REDACTED(?:_CARD)?\]", answer):
         pii_masked = True
 

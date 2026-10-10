@@ -177,6 +177,7 @@ class CopilotOrchestrator:
                 data=data_evidence,
                 routing=routing,
                 safety=safety_result,
+                question=safe_question,
             )
         except Exception:
             raw_response = {
