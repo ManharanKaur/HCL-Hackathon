@@ -5,6 +5,7 @@ the service/backend is available. Replace `get_mock_response` with the backend
 integration when it exists; do not expose credentials or raw restricted data.
 """
 
+
 import streamlit as st
 
 

@@ -1,0 +1,16 @@
+# Secrets and local environment files
+.env
+.env.*
+!.env.example
+
+# Python generated files
+__pycache__/
+*.py[cod]
+
+# Local ChromaDB data and generated results
+chroma_db/
+outputs/
+
+# Local development environment
+.venv/
+venv/
