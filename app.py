@@ -1,13 +1,8 @@
-"""Streamlit interface for the AI-Powered Retail Operations Copilot.
-
-The response below is intentionally mocked so the UI can be developed before
-the service/backend is available. Replace `get_mock_response` with the backend
-integration when it exists; do not expose credentials or raw restricted data.
-"""
-
+"""Streamlit interface for the AI-Powered Retail Operations Copilot."""
 
 import streamlit as st
 
+from reference_fields import parse_reference_field
 
 st.set_page_config(
     page_title="Retail Operations Copilot",
@@ -23,50 +18,28 @@ EXAMPLES = {
 
 
 def select_example() -> None:
-    """Copy a selected example into the question field without submitting it."""
+    """Copy the selected example into the form without submitting it."""
     selected = st.session_state.get("example_question")
     if selected in EXAMPLES:
         st.session_state["employee_question"] = EXAMPLES[selected]
 
 
-def get_mock_response(question: str) -> dict:
-    """Return safe, clearly illustrative content; this does not call a backend."""
-    text = question.casefold()
+def get_response(text: str) -> dict:
+    """Call the orchestrator entry point, preferring its public UI method."""
+    import orchestrator
 
-    if any(term in text for term in ("card number", "personal details", "customer data", "restricted")):
-        return {
-            "answer": "I can’t provide sensitive customer or payment data. Use the approved, access-controlled system for an authorized business need, and request only the minimum information required.",
-            "category": "Data access & privacy",
-            "priority": "High",
-            "confidence": "98%",
-            "citations": ["Mock policy: Customer and payment data must remain access-controlled."],
-            "datasets": ["None — no dataset accessed"],
-            "escalation": "Escalation recommended: contact your manager or the privacy/security team through approved channels.",
-            "safety": "Protected — request declined; no sensitive data was retrieved or displayed.",
-        }
+    # process_question is the requested UI entry point. Older project versions
+    # expose the same pipeline as run_copilot, so use it when needed.
+    process = getattr(orchestrator, "process_question", None)
+    if not callable(process):
+        process = getattr(orchestrator, "run_copilot", None)
+    if not callable(process):
+        raise RuntimeError("The orchestrator entry point is unavailable.")
 
-    if any(term in text for term in ("stock", "out of stock", "availability", "inventory")):
-        return {
-            "answer": "Check the approved inventory tool for nearby-store and distribution-center availability. If none is available, share the expected replenishment date or offer an approved alternative. Confirm the item and location before making a commitment.",
-            "category": "Inventory & availability",
-            "priority": "Normal",
-            "confidence": "91%",
-            "citations": ["Mock guide: Store inventory lookup and replenishment workflow."],
-            "datasets": ["Mock inventory guide (illustrative only)"],
-            "escalation": "No escalation indicated. Escalate to inventory support if counts appear inaccurate.",
-            "safety": "Clear — no restricted information included.",
-        }
-
-    return {
-        "answer": "Check that the printer is powered on, has paper, and is securely connected. Restart the printer and POS terminal using your store’s approved procedure. If the error continues, record the terminal ID and contact your store’s POS support channel.",
-        "category": "Point of sale (POS)",
-        "priority": "Normal",
-        "confidence": "90%",
-        "citations": ["Mock guide: POS printer first-line troubleshooting."],
-        "datasets": ["Mock POS troubleshooting guide (illustrative only)"],
-        "escalation": "Escalate to POS support if the issue remains after the approved checks.",
-        "safety": "Clear — no restricted information included.",
-    }
+    result = process(text)
+    if not isinstance(result, dict):
+        raise RuntimeError("The orchestrator returned an unexpected result.")
+    return result
 
 
 st.title("AI-Powered Retail Operations Copilot")
@@ -98,36 +71,72 @@ if submitted:
     if not question.strip():
         st.warning("Enter a question before requesting guidance.")
     else:
-        with st.spinner("Preparing guidance…"):
-            # Mock-only response. No question is sent to a service or echoed below.
-            response = get_mock_response(question)
-        st.session_state["copilot_response"] = response
+        try:
+            with st.spinner("Preparing guidance…"):
+                # The backend safety module masks or refuses sensitive requests.
+                st.session_state["copilot_response"] = get_response(question.strip())
+            st.session_state.pop("copilot_error", None)
+        except Exception:
+            # Do not show exception text: it can contain internal details or input.
+            st.session_state.pop("copilot_response", None)
+            st.session_state["copilot_error"] = (
+                "Guidance is temporarily unavailable. The backend or an AI service "
+                "may be unavailable; please try again later."
+            )
+
+if st.session_state.get("copilot_error"):
+    st.error(st.session_state["copilot_error"])
 
 response = st.session_state.get("copilot_response")
-if response:
+if isinstance(response, dict):
     st.divider()
-    st.caption("DEMO MODE · MOCK RESPONSE — illustrative content; no backend or live datasets are connected.")
-
     st.header("Answer")
-    st.info(response["answer"])
+    answer = response.get("answer")
+    st.info(answer if isinstance(answer, str) and answer.strip() else "No answer was returned.")
 
     st.subheader("Response details")
     col_category, col_priority, col_confidence = st.columns(3)
-    col_category.metric("Category", response["category"])
-    col_priority.metric("Priority", response["priority"])
-    col_confidence.metric("Confidence", response["confidence"])
+    col_category.metric("Category", response.get("category") or "Not provided")
+    col_priority.metric("Priority", response.get("priority") or "Not provided")
+
+    confidence = response.get("confidence")
+    if isinstance(confidence, (int, float)) and not isinstance(confidence, bool):
+        col_confidence.metric("Confidence", f"{confidence:.0%}")
+    else:
+        col_confidence.metric("Confidence", "Not provided")
 
     col_citations, col_datasets = st.columns(2)
     with col_citations:
         st.subheader("Citations")
-        for citation in response["citations"]:
-            st.markdown(f"- {citation}")
+        citations = parse_reference_field(response.get("citations"))
+        if citations:
+            for citation in citations:
+                st.markdown(f"- {citation}")
+        else:
+            st.caption("No policy citations were returned.")
+
     with col_datasets:
         st.subheader("Datasets used")
-        for dataset in response["datasets"]:
-            st.markdown(f"- {dataset}")
+        datasets = parse_reference_field(response.get("data_used"))
+        if datasets:
+            for dataset in datasets:
+                st.markdown(f"- {dataset}")
+        else:
+            st.caption("No datasets were used or reported.")
 
     st.subheader("Escalation status")
-    st.write(response["escalation"])
+    escalated = response.get("escalated") or "Not provided"
+    team = response.get("escalation_team")
+    escalation_text = str(escalated)
+    if team:
+        escalation_text += f" — {team}"
+    st.write(escalation_text)
+
     st.subheader("Safety status")
-    st.write(response["safety"])
+    refusal = response.get("safety_refusal") or "Not provided"
+    pii_masked = response.get("pii_masked") or "Not provided"
+    st.write(f"Safety refusal: {refusal} · Personal data masked: {pii_masked}")
+
+    notes = response.get("notes")
+    if isinstance(notes, str) and notes.strip():
+        st.caption(f"Notes: {notes}")

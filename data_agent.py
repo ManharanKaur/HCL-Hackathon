@@ -7,6 +7,8 @@ from pathlib import Path
 import pandas as pd
 
 from llm_client import chat_completion
+from diagnostics import log_failure
+from labels_and_citations import PRIORITIES
 from safety import check_request
 
 
@@ -21,7 +23,6 @@ ALLOWED_INTENTS = {
     "product_quality_by_sku",
     "unsupported",
 }
-ALLOWED_PRIORITIES = {"P1", "P2", "P3", "P4"}
 ALLOWED_TIME_WINDOWS = {"last_24_hours", "last_30_days", "none"}
 ALLOWED_STATUSES = {"unresolved", "open", "in progress", "closed", "all"}
 ALLOWED_GROUP_FIELDS = {"store", "category", "status", "priority", "vendor", "sku", "reason"}
@@ -99,7 +100,7 @@ def _extract_query(question: str) -> dict:
     if result["time_window"] not in ALLOWED_TIME_WINDOWS:
         raise ValueError("Time window is not supported.")
     if not isinstance(result["priorities"], list) or any(
-        priority not in ALLOWED_PRIORITIES for priority in result["priorities"]
+        priority not in PRIORITIES for priority in result["priorities"]
     ):
         raise ValueError("Priority filters must use the supplied P1-P4 labels.")
     if result["status"] is not None and (
@@ -438,10 +439,23 @@ def _quality_complaints_answer(filters: dict, by_vendor: bool) -> dict:
 
 
 def answer_data_question(question: str) -> dict:
-    """Use an allowlisted intent to select a pandas calculation over local CSVs."""
-    # Screen and mask the question before making any external model call.
-    safety_result = check_request(question or "")
-    if not safety_result["allowed"]:
+    """Use an allowlisted intent to select a pandas calculation over local CSVs.
+
+    Direct callers are screened here. The orchestrator uses the private
+    screened-text entry point after it performs the request's single screening
+    pass. Only cleaned text is used downstream.
+    """
+    return _answer_screened_data_question(check_request(question or ""))
+
+
+def _answer_screened_data_question(safety_result: dict) -> dict:
+    """Run the data agent using trusted output from safety.check_request."""
+    if (
+        not isinstance(safety_result, dict)
+        or safety_result.get("allowed") is not True
+        or safety_result.get("safety_refusal") == "Yes"
+        or not isinstance(safety_result.get("cleaned_text"), str)
+    ):
         return _empty_result(
             "I can’t help retrieve or expose restricted information.",
             "The request was refused by the safety check and was not sent to the model or CSV analysis.",
@@ -449,7 +463,8 @@ def answer_data_question(question: str) -> dict:
 
     try:
         filters = _extract_query(safety_result["cleaned_text"])
-    except Exception:
+    except Exception as error:
+        log_failure("data_agent.intent_generation", error)
         return _empty_result(
             "I could not safely identify a supported data query.",
             "The intent response was unavailable or invalid, so no generated query was run and no CSV was analyzed.",
@@ -471,15 +486,21 @@ def answer_data_question(question: str) -> dict:
             return _quality_complaints_answer(filters, by_vendor=True)
         if intent == "product_quality_by_sku":
             return _quality_complaints_answer(filters, by_vendor=False)
-    except (FileNotFoundError, pd.errors.EmptyDataError, pd.errors.ParserError):
+    except (FileNotFoundError, pd.errors.EmptyDataError, pd.errors.ParserError) as error:
+        log_failure("data_agent.query", error)
         return _empty_result(
             "I could not complete the data lookup because a required CSV file is unavailable or unreadable.",
             "Check the supplied files under data/ and try again.",
         )
-    except (KeyError, ValueError, TypeError):
+    except (KeyError, ValueError, TypeError) as error:
+        log_failure("data_agent.query", error)
         return _empty_result(
             "I could not safely calculate an answer from the supplied data.",
             "A required field or value was missing or could not be interpreted.",
         )
+    except Exception as error:
+        # Keep propagation intact for the orchestrator's existing fallback.
+        log_failure("data_agent.query", error)
+        raise
 
     return _empty_result("No data result was produced.", "The selected intent has no implementation.")

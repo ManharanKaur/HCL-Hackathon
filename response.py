@@ -3,6 +3,7 @@
 import re
 from pathlib import Path
 
+from labels_and_citations import CATEGORIES, PRIORITIES, citations_for_markdown
 from safety import mask_sensitive_data
 
 
@@ -10,17 +11,6 @@ ROOT_DIR = Path(__file__).resolve().parent
 KNOWLEDGE_BASE_DIR = ROOT_DIR / "knowledge_base"
 DATA_DIR = ROOT_DIR / "data"
 
-CATEGORIES = {
-    "POS and Payments",
-    "Inventory and Replenishment",
-    "Pricing and Promotions",
-    "Returns and Refunds",
-    "Vendor and Supply Chain",
-    "Product Quality and Safety",
-    "Customer Service",
-    "Other or Security",
-}
-PRIORITIES = {"P1", "P2", "P3", "P4"}
 YES_NO = {"Yes", "No"}
 
 
@@ -29,18 +19,11 @@ def _is_yes(value: object) -> bool:
     return value is True or (isinstance(value, str) and value.strip().casefold() == "yes")
 
 
-def _heading_anchor(heading: str) -> str:
-    """Create the same simple anchor used for headings in the policy index."""
-    anchor = heading.casefold().replace("&", " and ").replace("`", "")
-    anchor = re.sub(r"[^a-z0-9\s-]", "", anchor)
-    return re.sub(r"[\s-]+", "-", anchor).strip("-")
-
-
 def _valid_citation(citation: str) -> bool:
     """Check that a citation points to a real Markdown heading in this project."""
     if not isinstance(citation, str) or citation.count("#") != 1:
         return False
-    filename, anchor = citation.split("#", 1)
+    filename, _ = citation.split("#", 1)
     if Path(filename).name != filename or not filename.endswith(".md"):
         return False
 
@@ -48,13 +31,8 @@ def _valid_citation(citation: str) -> bool:
     if not policy_path.is_file():
         return False
 
-    heading_pattern = re.compile(r"(?m)^#{1,6}[ \t]+(.+?)\s*#*\s*$")
     markdown = policy_path.read_text(encoding="utf-8")
-    known_anchors = {
-        _heading_anchor(match.group(1).strip())
-        for match in heading_pattern.finditer(markdown)
-    }
-    return anchor in known_anchors
+    return citation in citations_for_markdown(filename, markdown)
 
 
 def _safe_text(value: object) -> str:

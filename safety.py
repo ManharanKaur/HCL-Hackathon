@@ -1,24 +1,36 @@
-"""Safety checks for employee questions before they reach an LLM or agent."""
+"""Safety and privacy checks that run before any model or data request."""
 
 import re
+from functools import lru_cache
 from typing import Any
 
 
-# Patterns cover common contact details and payment identifiers. These masks are
-# applied before the question is returned to another module.
-EMAIL_PATTERN = re.compile(
-    r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.IGNORECASE
-)
-PHONE_PATTERN = re.compile(r"(?<!\w)(?:\+?91[\s.-]?)?[6-9]\d{9}(?!\w)")
-CARD_PATTERN = re.compile(r"(?<!\d)(?:\d[ -]?){12,18}\d(?!\d)")
-AADHAAR_PATTERN = re.compile(r"(?<!\d)\d{4}[ -]?\d{4}[ -]?\d{4}(?!\d)")
-LABELED_SECRET_PATTERN = re.compile(
-    r"(?i)\b(cvv|cvc|pin|otp|password|passcode|token|account number)"
+# Use Presidio for personal and payment data recognition. Keeping the entity
+# names here makes it clear which types of information are anonymized.
+PII_ENTITIES = [
+    "PERSON",
+    "PHONE_NUMBER",
+    "EMAIL_ADDRESS",
+    "CREDIT_CARD",
+    "LOCATION",
+    "IBAN_CODE",
+    "US_SSN",
+    "US_PASSPORT",
+    "US_DRIVER_LICENSE",
+    "US_BANK_NUMBER",
+    "IP_ADDRESS",
+]
+
+# These are credential secrets rather than personal-identity entities. Keep a
+# small deterministic mask for them because Presidio's default recognizers do
+# not identify every store-specific PIN, OTP, or password label.
+CREDENTIAL_PATTERN = re.compile(
+    r"(?i)\b(cvv|cvc|pin|otp|password|passcode|token)"
     r"(\s*(?:is|:|=)\s*)[^\s,;]+"
 )
 
-# Words that indicate a request to retrieve, reveal, or otherwise access
-# information that policy keeps private. The patterns accept common word order.
+# These rules identify unsafe intent, not PII. They remain deterministic and
+# run after Presidio has anonymized the text and before any LLM call.
 RESTRICTED_DATA_PATTERNS = (
     re.compile(
         r"\b(show|reveal|display|give|send|share|list|export|print|retrieve|"
@@ -47,58 +59,114 @@ BYPASS_PATTERNS = (
 )
 
 
+class PresidioUnavailableError(RuntimeError):
+    """Signals that PII could not be safely checked or anonymized."""
+
+
+@lru_cache(maxsize=1)
+def _get_presidio_engines():
+    """Create the analyzer and anonymizer once, then reuse them for all calls."""
+    try:
+        from presidio_analyzer import AnalyzerEngine
+        from presidio_anonymizer import AnonymizerEngine
+    except Exception:
+        # Keep dependency/model error details out of messages and logs.
+        raise PresidioUnavailableError("Presidio privacy screening is unavailable.") from None
+
+    try:
+        analyzer = AnalyzerEngine()
+        anonymizer = AnonymizerEngine()
+    except Exception:
+        # AnalyzerEngine loads the configured spaCy model here. If that model
+        # is missing or broken, callers must block instead of sending raw text.
+        raise PresidioUnavailableError("Presidio privacy screening is unavailable.") from None
+
+    return analyzer, anonymizer
+
+
 def mask_sensitive_data(text: str) -> tuple[str, bool]:
-    """Replace recognizable personal and payment details with safe markers.
+    """Return text with Presidio-detected PII replaced by entity placeholders.
 
-    Phone numbers keep only their final four digits, matching the responsible
-    AI policy. Payment card numbers and government identifiers are fully
-    replaced so their original values cannot flow to later processing.
+    For example, a detected phone number becomes ``<PHONE_NUMBER>``. If
+    Presidio cannot analyze or anonymize the text, this function raises a
+    generic error; its caller must not continue with the original text.
     """
-    masked_text = text
-    found_sensitive_data = False
+    if not isinstance(text, str) or not text:
+        return "", False
 
-    def mask_email(match: re.Match[str]) -> str:
-        local_part, domain = match.group(0).split("@", 1)
-        if len(local_part) <= 2:
-            masked_local = local_part[0] + "*" * max(1, len(local_part) - 1)
+    try:
+        from presidio_anonymizer.entities import OperatorConfig
+
+        analyzer, anonymizer = _get_presidio_engines()
+        findings = analyzer.analyze(
+            text=text,
+            entities=PII_ENTITIES,
+            language="en",
+        )
+
+        # Tell Presidio's anonymizer to replace each recognized value with a
+        # visible tag naming the entity type, without retaining any characters.
+        replacement_operators = {
+            finding.entity_type: OperatorConfig(
+                "replace",
+                {"new_value": f"<{finding.entity_type}>"},
+            )
+            for finding in findings
+        }
+        if findings:
+            anonymized = anonymizer.anonymize(
+                text=text,
+                analyzer_results=findings,
+                operators=replacement_operators,
+            ).text
+            was_masked = True
         else:
-            masked_local = local_part[0] + "*" * (len(local_part) - 2) + local_part[-1]
-        return f"{masked_local}@{domain}"
+            anonymized = text
+            was_masked = False
 
-    def mask_phone(match: re.Match[str]) -> str:
-        digits = re.sub(r"\D", "", match.group(0))
-        return "******" + digits[-4:]
-
-    def replace_pattern(pattern: re.Pattern[str], replacement: Any) -> None:
-        nonlocal masked_text, found_sensitive_data
-        masked_text, count = pattern.subn(replacement, masked_text)
-        found_sensitive_data = found_sensitive_data or count > 0
-
-    replace_pattern(EMAIL_PATTERN, mask_email)
-    replace_pattern(PHONE_PATTERN, mask_phone)
-    replace_pattern(AADHAAR_PATTERN, "[REDACTED]")
-
-    def mask_card(match: re.Match[str]) -> str:
-        digits = re.sub(r"\D", "", match.group(0))
-        # Do not mistake a 12-digit identifier already covered as Aadhaar for a card.
-        return "[REDACTED_CARD]" if len(digits) >= 13 else match.group(0)
-
-    replace_pattern(CARD_PATTERN, mask_card)
-
-    def mask_labeled_secret(match: re.Match[str]) -> str:
-        return f"{match.group(1)}{match.group(2)}[REDACTED]"
-
-    replace_pattern(LABELED_SECRET_PATTERN, mask_labeled_secret)
-    return masked_text, found_sensitive_data
+        # Mask labelled credentials separately; these are secrets, not PII
+        # entity detection, so this rule does not replace Presidio recognition.
+        anonymized, credential_count = CREDENTIAL_PATTERN.subn(
+            r"\1\2<CREDENTIAL>", anonymized
+        )
+        return anonymized, was_masked or credential_count > 0
+    except PresidioUnavailableError:
+        raise
+    except Exception:
+        # Do not include the exception text because third-party errors may
+        # include snippets of the text that was being analyzed.
+        raise PresidioUnavailableError("Presidio privacy screening is unavailable.") from None
 
 
-def check_request(question: str) -> dict:
-    """Check and sanitize a question before any LLM or downstream processing.
+def _blocked_for_screening_failure() -> dict[str, Any]:
+    """Return a generic fail-closed result when PII protection is unavailable."""
+    return {
+        "allowed": False,
+        "cleaned_text": "Request withheld because personal-data screening is unavailable.",
+        "pii_masked": "No",
+        "safety_refusal": "Yes",
+        "security_escalation": "No",
+        "refusal_message": (
+            "I can’t process this request because privacy screening is unavailable. "
+            "Please retry later or ask a human reviewer for help."
+        ),
+        "reason": "Privacy screening is unavailable; the request is blocked for human review.",
+        "blocked": True,
+        "review_needed": True,
+    }
 
-    Unsafe access and bypass requests receive a generic refusal, rather than
-    an echoed copy of the question. Raw input is never logged or returned.
+
+def check_request(question: str) -> dict[str, Any]:
+    """Check and sanitize an employee question before downstream processing.
+
+    Unsafe access and bypass requests receive a generic refusal. Raw input and
+    third-party exception details are never returned or logged.
     """
-    safe_text, pii_was_masked = mask_sensitive_data(question or "")
+    try:
+        safe_text, pii_was_masked = mask_sensitive_data(question or "")
+    except PresidioUnavailableError:
+        return _blocked_for_screening_failure()
+
     asks_for_restricted_data = any(
         pattern.search(safe_text) for pattern in RESTRICTED_DATA_PATTERNS
     )
@@ -108,7 +176,7 @@ def check_request(question: str) -> dict:
     unsafe_request = asks_for_restricted_data or attempts_to_bypass_rules
 
     if unsafe_request:
-        # Keep the original request out of the response passed to later modules.
+        # Do not pass even the anonymized unsafe request downstream.
         return {
             "allowed": False,
             "cleaned_text": "Restricted request withheld. Use an approved, access-controlled process.",
@@ -117,6 +185,8 @@ def check_request(question: str) -> dict:
             "security_escalation": "Yes",
             "refusal_message": "I can’t provide restricted information. Use an approved, access-controlled process for an authorized business need.",
             "reason": "The request seeks restricted information or attempts to bypass safety rules.",
+            "blocked": True,
+            "review_needed": True,
         }
 
     return {
@@ -127,4 +197,6 @@ def check_request(question: str) -> dict:
         "security_escalation": "No",
         "refusal_message": "",
         "reason": "No restricted-data access or safety-bypass request was detected.",
+        "blocked": False,
+        "review_needed": False,
     }

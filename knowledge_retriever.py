@@ -4,6 +4,8 @@ import hashlib
 import re
 from pathlib import Path
 
+from diagnostics import log_failure
+from labels_and_citations import heading_to_anchor
 from llm_client import get_embedding
 
 
@@ -49,16 +51,31 @@ def _get_collection():
     try:
         import chromadb
     except ImportError as error:
-        raise RuntimeError(
+        failure = RuntimeError(
             "Policy search requires ChromaDB. Install the 'chromadb' package before searching."
-        ) from error
+        )
+        log_failure("policy.chromadb", failure)
+        raise failure from error
 
     # PersistentClient writes the vector index under the project-root directory.
-    client = chromadb.PersistentClient(path=str(CHROMA_DIR))
-    return client.get_or_create_collection(
-        name=COLLECTION_NAME,
-        metadata={"hnsw:space": "cosine"},
-    )
+    try:
+        client = chromadb.PersistentClient(path=str(CHROMA_DIR))
+        return client.get_or_create_collection(
+            name=COLLECTION_NAME,
+            metadata={"hnsw:space": "cosine"},
+        )
+    except Exception as error:
+        log_failure("policy.chromadb", error)
+        raise
+
+
+def _chroma_call(stage: str, operation, *args, **kwargs):
+    """Log Chroma failures without including call arguments or exception text."""
+    try:
+        return operation(*args, **kwargs)
+    except Exception as error:
+        log_failure(stage, error)
+        raise
 
 
 def _make_stable_id(filename: str, heading: str, occurrence: int = 1) -> str:
@@ -132,7 +149,7 @@ def _ensure_indexed(collection) -> None:
     """
     sections = _read_policy_sections()
     current_ids = [section["id"] for section in sections]
-    existing = collection.get(ids=current_ids, include=["metadatas"]) if current_ids else {
+    existing = _chroma_call("policy.chromadb_index", collection.get, ids=current_ids, include=["metadatas"]) if current_ids else {
         "ids": [],
         "metadatas": [],
     }
@@ -158,7 +175,7 @@ def _ensure_indexed(collection) -> None:
             raise RuntimeError("The embedding service returned an unexpected number of policy vectors.")
 
         # Chroma metadata values are kept simple and scalar for compatibility.
-        collection.upsert(
+        _chroma_call("policy.chromadb_index", collection.upsert,
             ids=[section["id"] for section in sections_to_embed],
             documents=[section["document"] for section in sections_to_embed],
             embeddings=embeddings,
@@ -174,17 +191,10 @@ def _ensure_indexed(collection) -> None:
         )
 
     # Remove records for headings or files that have since been deleted.
-    all_existing = collection.get(include=["metadatas"])
+    all_existing = _chroma_call("policy.chromadb_index", collection.get, include=["metadatas"])
     stale_ids = [section_id for section_id in all_existing["ids"] if section_id not in set(current_ids)]
     if stale_ids:
-        collection.delete(ids=stale_ids)
-
-
-def _heading_anchor(heading: str) -> str:
-    """Convert a Markdown heading to the usual lowercase citation anchor."""
-    anchor = heading.casefold().replace("&", " and ").replace("`", "")
-    anchor = re.sub(r"[^a-z0-9\s-]", "", anchor)
-    return re.sub(r"[\s-]+", "-", anchor).strip("-")
+        _chroma_call("policy.chromadb_index", collection.delete, ids=stale_ids)
 
 
 def search_policy(query: str, category: str | None = None, top_k: int = 3) -> dict:
@@ -200,7 +210,7 @@ def search_policy(query: str, category: str | None = None, top_k: int = 3) -> di
 
     collection = _get_collection()
     _ensure_indexed(collection)
-    document_count = collection.count()
+    document_count = _chroma_call("policy.chromadb_retrieval", collection.count)
     if document_count == 0:
         return {"passages": []}
 
@@ -210,7 +220,7 @@ def search_policy(query: str, category: str | None = None, top_k: int = 3) -> di
         return {"passages": []}
 
     # Ask for all sections so category filtering does not hide a good match.
-    matches = collection.query(
+    matches = _chroma_call("policy.chromadb_retrieval", collection.query,
         query_embeddings=[query_vectors[0]],
         n_results=document_count,
         include=["documents", "metadatas", "distances"],
@@ -242,7 +252,7 @@ def search_policy(query: str, category: str | None = None, top_k: int = 3) -> di
                 "text": document,
                 "filename": filename,
                 "heading": heading,
-                "citation": f"{filename}#{_heading_anchor(heading)}",
+                "citation": f"{filename}#{heading_to_anchor(heading)}",
                 "distance": float(distance),
                 "id": section_id,
             }

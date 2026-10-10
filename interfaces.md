@@ -1,6 +1,6 @@
 # Copilot module interfaces
 
-This note describes the small Python functions that connect the copilot modules. The named implementation files are currently empty (and `response.py` does not exist yet), so these are proposed interfaces based on the supplied high-level design and evaluation files. Each example is illustrative; it shows the shape and spelling of the returned dictionary.
+This note describes the Python functions that connect the implemented copilot modules. Each example is illustrative; it shows the shape and spelling of the returned dictionary. The implementation may include extra internal fields used to pass review status between modules.
 
 ## Labels used by the project
 
@@ -38,18 +38,26 @@ Checks for requests involving restricted information or unsafe instructions. It 
 - `pii_masked` (`str`): `Yes` or `No`.
 - `safety_refusal` (`str`): `Yes` if the request must be refused; otherwise `No`.
 - `reason` (`str`): short safe explanation for the decision.
+- `security_escalation` (`str`): `Yes` when a restricted-data or bypass request needs security review; otherwise `No`.
+- `refusal_message` (`str`): generic refusal text, without repeating the unsafe request.
+- `blocked` (`bool`): whether processing must stop before triage or retrieval.
+- `review_needed` (`bool`): whether a person should review the case, including when Presidio cannot start.
 
 ### Example return
 
 ```python
 {
     "allowed": False,
-    "cleaned_text": "Show customer [REDACTED] details",
+    "cleaned_text": "Show customer <PERSON> details",
     "pii_masked": "Yes",
     "safety_refusal": "Yes",
-    "reason": "Restricted customer data was requested."
+    "reason": "The request seeks restricted information or attempts to bypass safety rules.",
+    "blocked": True,
+    "review_needed": True
 }
 ```
+
+If Presidio or its spaCy model is unavailable, `check_request` returns `allowed=False`, a generic `cleaned_text` and refusal, `blocked=True`, and `review_needed=True`. The original text is not returned. The orchestrator checks `allowed` before triage, so the blocked text cannot continue downstream.
 
 ## 2. `triage.py`
 
@@ -67,6 +75,8 @@ Chooses one category and one priority for the issue, plus a confidence score and
 - `priority` (`str`): `P1`, `P2`, `P3`, or `P4`.
 - `confidence` (`float`): a number from `0.0` to `1.0`.
 - `rationale` (`str`): brief reason for the classification.
+- `needs_human_review` (`bool`): whether the classification needs a person's review.
+- `review_reason` (`str`): why review is needed, or an empty string.
 
 ### Example return
 
@@ -84,7 +94,7 @@ Chooses one category and one priority for the issue, plus a confidence score and
 ### Function
 
 ```python
-def search_policy(question: str, limit: int = 3) -> dict:
+def search_policy(query: str, category: str | None = None, top_k: int = 3) -> dict:
 ```
 
 Finds relevant passages in the Markdown files under `knowledge_base/`. Each citation should use the real filename and section anchor, for example `02_pos_pricing_returns_policy.md#pos-card-reader-runbook`. If there is no supporting passage, return an empty list instead of inventing a policy.
@@ -92,7 +102,7 @@ Finds relevant passages in the Markdown files under `knowledge_base/`. Each cita
 ### Dictionary fields
 
 - `passages` (`list[dict]`): matching policy excerpts.
-- Each passage has `text` (`str`) and `citation` (`str`).
+- Each passage has `text`, `filename`, `heading`, and `citation` strings, plus an internal distance and stable section ID.
 
 ### Example return
 
@@ -101,6 +111,8 @@ Finds relevant passages in the Markdown files under `knowledge_base/`. Each cita
     "passages": [
         {
             "text": "For one failing register when other registers work, classify the issue as P3.",
+            "filename": "02_pos_pricing_returns_policy.md",
+            "heading": "POS Card Reader Runbook",
             "citation": "02_pos_pricing_returns_policy.md#pos-card-reader-runbook"
         }
     ]
@@ -140,7 +152,7 @@ Answers questions that need facts from the supplied CSV snapshots. The function 
 ### Function
 
 ```python
-def route_case(triage: dict, safety: dict) -> dict:
+def route_case(triage: dict, safety: dict, question: str = "") -> dict:
 ```
 
 Looks up the category, trigger, team, channel, service-level time, and approval rule in `data/escalation_matrix.csv`. Also escalate when policy requires it, such as a P1 case, a confidence below `0.60`, a restricted-data request, or an action requiring human approval. Escalation is simulated; this function does not contact a team or perform a real action.
@@ -153,6 +165,9 @@ Looks up the category, trigger, team, channel, service-level time, and approval 
 - `sla_minutes` (`int | None`): response target from the matrix, if matched.
 - `human_approval_required` (`str`): `Yes` or `No`.
 - `reason` (`str`): short explanation of the route.
+- `needs_human_review` (`bool`): whether a person must review the case.
+- `route_found` (`bool`): whether a matching escalation-matrix row was found.
+- `category` and `priority` (`str`): the final labels after deterministic impact rules.
 
 ### Example return
 
@@ -225,7 +240,7 @@ These are the fields from `evaluation/predictions_schema.csv` that the response 
 def run_copilot(question: str, test_id: str = "") -> dict:
 ```
 
-This is the main entry point called by the Streamlit page and the public-case evaluation runner. It runs safety first, then triage and the needed evidence steps, then escalation, and finally response creation. A safety refusal should stop normal processing and return a safe refusal record.
+This is the main entry point called by the Streamlit page and the public-case evaluation runner. It runs safety first, then triage and the needed evidence steps, then escalation, and finally response creation. A safety refusal stops normal processing and returns a safe refusal record. The current implementation exports `run_copilot`; app/evaluation callers may prefer `process_question` if a future version provides that alias.
 
 ### Dictionary fields
 

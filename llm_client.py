@@ -25,6 +25,9 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
+from diagnostics import log_failure
+
+
 # Custom Exception Hierarchy
 class LLMClientError(Exception):
     """Base exception for all LLM client errors."""
@@ -321,8 +324,12 @@ def get_embedding(
     - model: str
     - dimensions: int
     """
-    api_key = get_api_key()
-    base_url = get_base_url()
+    try:
+        api_key = get_api_key()
+        base_url = get_base_url()
+    except Exception as error:
+        log_failure("embedding.call", error)
+        raise
     selected_model = model or os.environ.get("EMBEDDING_MODEL", "nvidia/nemotron-3-embed-1b:free")
 
     payload = {
@@ -379,6 +386,7 @@ def get_embedding(
                 if attempt < max_retries:
                     time.sleep(2.0 * (attempt + 1))
                     continue
+                log_failure("embedding.call", last_error)
                 raise last_error
 
             if status_code in (500, 502, 503, 504):
@@ -389,18 +397,26 @@ def get_embedding(
                 if attempt < max_retries:
                     time.sleep(1.5 * (attempt + 1))
                     continue
+                log_failure("embedding.call", last_error)
                 raise last_error
 
-            raise ProviderAPIError(
+            error = ProviderAPIError(
                 f"Embedding API call failed with HTTP {status_code}.",
                 status_code=status_code,
             )
+            log_failure("embedding.call", error)
+            raise error
 
         except Exception as e:
             if isinstance(e, LLMClientError):
+                log_failure("embedding.call", e)
                 raise
-            raise ProviderAPIError(f"Unexpected error getting embeddings: {e}") from e
+            error = ProviderAPIError("Unexpected error getting embeddings.")
+            log_failure("embedding.call", error)
+            raise error from e
 
     if last_error:
         raise last_error
-    raise ProviderAPIError("Failed to obtain embeddings from provider.")
+    error = ProviderAPIError("Failed to obtain embeddings from provider.")
+    log_failure("embedding.call", error)
+    raise error

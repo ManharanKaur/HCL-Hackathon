@@ -5,23 +5,13 @@ import math
 import re
 
 from llm_client import chat_completion
+from diagnostics import log_failure
+from labels_and_citations import CATEGORIES, PRIORITIES
 from safety import check_request
 
 
 DEFAULT_MODEL = "nvidia/nemotron-3.5-lightning:free"
 LOW_CONFIDENCE_THRESHOLD = 0.60
-
-CATEGORIES = {
-    "POS and Payments",
-    "Inventory and Replenishment",
-    "Pricing and Promotions",
-    "Returns and Refunds",
-    "Vendor and Supply Chain",
-    "Product Quality and Safety",
-    "Customer Service",
-    "Other or Security",
-}
-PRIORITIES = {"P1", "P2", "P3", "P4"}
 
 # These rules can raise priority after the model responds. A model answer must
 # never lower an immediate safety or store-wide payment outage to a routine case.
@@ -112,16 +102,23 @@ def _apply_priority_overrides(question: str, result: dict) -> dict:
 def classify_request(question: str) -> dict:
     """Return category, priority, confidence, and rationale for one question.
 
-    Safety screening and masking happen before the LLM call. Confidence is the
-    model's estimate, not a calibrated probability; scores below 0.60 need a
-    person to review the result.
+    Direct callers are screened here. The orchestrator uses the private
+    screened-text entry point after it performs the request's single screening
+    pass. Confidence is not calibrated; scores below 0.60 need review.
     """
-    # Do not send unsafe or unmasked input to the model. `check_request` returns
-    # generic text for unsafe requests and masks recognizable PII in safe text.
-    safety_result = check_request(question or "")
-    safe_question = safety_result["cleaned_text"]
+    return _classify_screened_request(check_request(question or ""))
 
-    if not safety_result["allowed"]:
+
+def _classify_screened_request(safety_result: dict) -> dict:
+    """Classify trusted output from safety.check_request without screening again."""
+    if not isinstance(safety_result, dict):
+        return _fallback_result("Safety screening did not return a valid result.")
+
+    safe_question = safety_result.get("cleaned_text")
+    if not isinstance(safe_question, str):
+        return _fallback_result("Safety screening did not return cleaned text.")
+
+    if safety_result.get("allowed") is not True or safety_result.get("safety_refusal") == "Yes":
         result = {
             "category": "Other or Security",
             "priority": "P1",
@@ -157,7 +154,8 @@ def classify_request(question: str) -> dict:
             temperature=0.0,
         )
         parsed = _parse_model_response(model_response.get("content", ""))
-    except Exception:
+    except Exception as error:
+        log_failure("triage.chat_completion", error)
         # Keep provider details and any input text out of error messages.
         result = _fallback_result(
             "Classification could not be verified because the model call or response failed."
