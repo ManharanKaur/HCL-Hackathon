@@ -1,13 +1,18 @@
-"""LLM-assisted classification with deterministic high-risk overrides."""
+"""LLM-assisted classification with deterministic high-risk overrides.
+
+This module has a single responsibility: Classifying sanitized questions
+into category, priority, confidence, and rationale. It does NOT perform
+safety screening or PII masking.
+"""
 
 import json
 import math
 import re
+from typing import Any
 
 from llm_client import chat_completion
 from diagnostics import log_failure
 from labels_and_citations import CATEGORIES, PRIORITIES
-from safety import check_request
 
 
 DEFAULT_MODEL = "nvidia/nemotron-3.5-lightning:free"
@@ -99,81 +104,77 @@ def _apply_priority_overrides(question: str, result: dict) -> dict:
     return result
 
 
-def classify_request(question: str) -> dict:
-    """Return category, priority, confidence, and rationale for one question.
+class TriageAgent:
+    """Triage classifier agent implementing Single Responsibility Principle."""
 
-    Direct callers are screened here. The orchestrator uses the private
-    screened-text entry point after it performs the request's single screening
-    pass. Confidence is not calibrated; scores below 0.60 need review.
-    """
-    return _classify_screened_request(check_request(question or ""))
+    def __init__(self, model: str = DEFAULT_MODEL):
+        self.model = model
 
+    def classify(self, text: str) -> dict:
+        """Classify a pre-sanitized question into category, priority, and confidence."""
+        safe_question = text.strip() if isinstance(text, str) else ""
+        if not safe_question:
+            return _fallback_result("Empty question provided for triage.")
 
-def _classify_screened_request(safety_result: dict) -> dict:
-    """Classify trusted output from safety.check_request without screening again."""
-    if not isinstance(safety_result, dict):
-        return _fallback_result("Safety screening did not return a valid result.")
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "Classify the employee's retail operations question. Return only one valid JSON object "
+                    "with exactly these fields: category, priority, confidence, reason. "
+                    "Use category exactly one of: POS and Payments; Inventory and Replenishment; "
+                    "Pricing and Promotions; Returns and Refunds; Vendor and Supply Chain; "
+                    "Product Quality and Safety; Customer Service; Other or Security. "
+                    "Use priority exactly one of P1, P2, P3, P4. Confidence must be a number from 0 to 1. "
+                    "P1 is immediate human escalation, P2 is high impact, P3 is routine, and P4 is a general inquiry. "
+                    "The reason must be a short string. Do not add markdown or any text outside the JSON object."
+                ),
+            },
+            {"role": "user", "content": safe_question},
+        ]
 
-    safe_question = safety_result.get("cleaned_text")
-    if not isinstance(safe_question, str):
-        return _fallback_result("Safety screening did not return cleaned text.")
+        try:
+            model_response = chat_completion(
+                messages,
+                model=self.model,
+                temperature=0.0,
+            )
+            parsed = _parse_model_response(model_response.get("content", ""))
+        except Exception as error:
+            log_failure("triage.chat_completion", error)
+            result = _fallback_result(
+                "Classification could not be verified because the model call or response failed."
+            )
+            return _apply_priority_overrides(safe_question, result)
 
-    if safety_result.get("allowed") is not True or safety_result.get("safety_refusal") == "Yes":
         result = {
-            "category": "Other or Security",
-            "priority": "P1",
-            "confidence": 1.0,
-            "rationale": "Restricted-data or safety-bypass request refused and sent for security review.",
-            "needs_human_review": True,
-            "review_reason": "Security escalation is required for this request.",
+            "category": parsed["category"],
+            "priority": parsed["priority"],
+            "confidence": parsed["confidence"],
+            "rationale": parsed["reason"],
+            "needs_human_review": False,
+            "review_reason": "",
         }
-        return result
 
-    messages = [
-        {
-            "role": "system",
-            "content": (
-                "Classify the employee's retail operations question. Return only one valid JSON object "
-                "with exactly these fields: category, priority, confidence, reason. "
-                "Use category exactly one of: POS and Payments; Inventory and Replenishment; "
-                "Pricing and Promotions; Returns and Refunds; Vendor and Supply Chain; "
-                "Product Quality and Safety; Customer Service; Other or Security. "
-                "Use priority exactly one of P1, P2, P3, P4. Confidence must be a number from 0 to 1. "
-                "P1 is immediate human escalation, P2 is high impact, P3 is routine, and P4 is a general inquiry. "
-                "The reason must be a short string. Do not add markdown or any text outside the JSON object."
-            ),
-        },
-        {"role": "user", "content": safe_question},
-    ]
+        if result["confidence"] < LOW_CONFIDENCE_THRESHOLD:
+            result["needs_human_review"] = True
+            result["review_reason"] = "Model confidence is below 0.60."
 
-    try:
-        # Do not pass response_format: the selected free model does not support it.
-        model_response = chat_completion(
-            messages,
-            model=DEFAULT_MODEL,
-            temperature=0.0,
-        )
-        parsed = _parse_model_response(model_response.get("content", ""))
-    except Exception as error:
-        log_failure("triage.chat_completion", error)
-        # Keep provider details and any input text out of error messages.
-        result = _fallback_result(
-            "Classification could not be verified because the model call or response failed."
-        )
         return _apply_priority_overrides(safe_question, result)
 
-    result = {
-        "category": parsed["category"],
-        "priority": parsed["priority"],
-        "confidence": parsed["confidence"],
-        "rationale": parsed["reason"],
-        "needs_human_review": False,
-        "review_reason": "",
-    }
 
-    # A low estimate signals uncertainty, even when the JSON is valid.
-    if result["confidence"] < LOW_CONFIDENCE_THRESHOLD:
-        result["needs_human_review"] = True
-        result["review_reason"] = "Model confidence is below 0.60."
+def classify_request(question: str) -> dict:
+    """Top-level classification function using TriageAgent."""
+    return TriageAgent().classify(question)
 
-    return _apply_priority_overrides(safe_question, result)
+
+def _classify_screened_request(screened_input: Any) -> dict:
+    """Compatibility entry point taking either text or a dictionary."""
+    if isinstance(screened_input, dict):
+        text = screened_input.get("cleaned_text") or screened_input.get("question") or ""
+    elif isinstance(screened_input, str):
+        text = screened_input
+    else:
+        text = ""
+    return classify_request(text)
+

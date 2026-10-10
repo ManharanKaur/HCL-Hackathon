@@ -197,67 +197,77 @@ def _ensure_indexed(collection) -> None:
         _chroma_call("policy.chromadb_index", collection.delete, ids=stale_ids)
 
 
-def search_policy(query: str, category: str | None = None, top_k: int = 3) -> dict:
-    """Return matching policy passages with citations from stored metadata.
+class KnowledgeAgent:
+    """Knowledge / RAG agent for policy retrieval from local ChromaDB.
 
-    The query is embedded with the separate embedding model. Chroma ranks the
-    stored sections by vector distance; optional category filtering uses the
-    category tags saved with each section. No citation is made up when there
-    are no close matches.
+    Adheres to Single Responsibility Principle: policy retrieval and matching only.
     """
-    if not isinstance(query, str) or not query.strip() or top_k <= 0:
-        return {"passages": []}
 
-    collection = _get_collection()
-    _ensure_indexed(collection)
-    document_count = _chroma_call("policy.chromadb_retrieval", collection.count)
-    if document_count == 0:
-        return {"passages": []}
+    def __init__(self, embedding_model: str = DEFAULT_EMBEDDING_MODEL):
+        self.embedding_model = embedding_model
 
-    query_result = get_embedding(query.strip(), model=DEFAULT_EMBEDDING_MODEL)
-    query_vectors = query_result.get("embeddings", [])
-    if not query_vectors or not query_vectors[0]:
-        return {"passages": []}
+    def search(self, query: str, category: str | None = None, top_k: int = 3) -> dict:
+        """Return matching policy passages with citations from stored metadata."""
+        if not isinstance(query, str) or not query.strip() or top_k <= 0:
+            return {"passages": []}
 
-    # Ask for all sections so category filtering does not hide a good match.
-    matches = _chroma_call("policy.chromadb_retrieval", collection.query,
-        query_embeddings=[query_vectors[0]],
-        n_results=document_count,
-        include=["documents", "metadatas", "distances"],
-    )
+        collection = _get_collection()
+        _ensure_indexed(collection)
+        document_count = _chroma_call("policy.chromadb_retrieval", collection.count)
+        if document_count == 0:
+            return {"passages": []}
 
-    passages = []
-    ids = matches.get("ids", [[]])[0]
-    documents = matches.get("documents", [[]])[0]
-    metadatas = matches.get("metadatas", [[]])[0]
-    distances = matches.get("distances", [[]])[0]
+        query_result = get_embedding(query.strip(), model=self.embedding_model)
+        query_vectors = query_result.get("embeddings", [])
+        if not query_vectors or not query_vectors[0]:
+            return {"passages": []}
 
-    for section_id, document, metadata, distance in zip(ids, documents, metadatas, distances):
-        if document is None or metadata is None or distance is None:
-            continue
-        if distance > MAX_COSINE_DISTANCE:
-            continue
-
-        stored_categories = metadata.get("categories", "").split("|")
-        if category and category not in stored_categories:
-            continue
-
-        filename = metadata.get("filename", "")
-        heading = metadata.get("heading", "")
-        if not filename or not heading:
-            continue
-
-        passages.append(
-            {
-                "text": document,
-                "filename": filename,
-                "heading": heading,
-                "citation": f"{filename}#{heading_to_anchor(heading)}",
-                "distance": float(distance),
-                "id": section_id,
-            }
+        matches = _chroma_call(
+            "policy.chromadb_retrieval",
+            collection.query,
+            query_embeddings=[query_vectors[0]],
+            n_results=document_count,
+            include=["documents", "metadatas", "distances"],
         )
-        if len(passages) >= top_k:
-            break
 
-    return {"passages": passages}
+        passages = []
+        ids = matches.get("ids", [[]])[0]
+        documents = matches.get("documents", [[]])[0]
+        metadatas = matches.get("metadatas", [[]])[0]
+        distances = matches.get("distances", [[]])[0]
+
+        for section_id, document, metadata, distance in zip(ids, documents, metadatas, distances):
+            if document is None or metadata is None or distance is None:
+                continue
+            if distance > MAX_COSINE_DISTANCE:
+                continue
+
+            stored_categories = metadata.get("categories", "").split("|")
+            if category and category not in stored_categories:
+                continue
+
+            filename = metadata.get("filename", "")
+            heading = metadata.get("heading", "")
+            if not filename or not heading:
+                continue
+
+            passages.append(
+                {
+                    "text": document,
+                    "filename": filename,
+                    "heading": heading,
+                    "citation": f"{filename}#{heading_to_anchor(heading)}",
+                    "distance": float(distance),
+                    "id": section_id,
+                }
+            )
+            if len(passages) >= top_k:
+                break
+
+        return {"passages": passages}
+
+
+def search_policy(query: str, category: str | None = None, top_k: int = 3) -> dict:
+    """Return matching policy passages using KnowledgeAgent."""
+    return KnowledgeAgent().search(query, category=category, top_k=top_k)
+

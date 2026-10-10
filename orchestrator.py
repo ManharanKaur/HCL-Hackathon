@@ -1,211 +1,214 @@
-"""Connect the copilot modules while keeping safety as the first gate."""
+"""Orchestrator connecting retail operations copilot modules.
+
+Dataflow strictly follows the architecture diagram:
+1. Employee enters issue or question
+2. Input normalization (InputNormalizer)
+3. Safety Gate (SafetyGate):
+   - Unsafe / restricted -> Safe refusal + security escalation -> Output Validator
+   - Safe -> Triage Agent
+4. Triage Agent -> Category + Priority + Confidence
+5. What evidence is needed? (EvidenceRouter):
+   - Policy -> Knowledge / RAG Agent
+   - Business data -> Retail Data Agent
+   - Both -> Knowledge / RAG Agent & Retail Data Agent
+6. Evidence Bundle (EvidenceBundle)
+7. Workflow & Escalation Engine (WorkflowEngine)
+8. Response Composer (ResponseComposer)
+9. Output Validator (OutputValidator)
+10. Answer displayed in UI / Evaluation predictions.csv
+"""
 
 from typing import Any
 
-from labels_and_citations import CATEGORIES, PRIORITIES
+from evidence import EvidenceBundle, EvidenceRouter
+from knowledge_retriever import KnowledgeAgent
+from data_agent import RetailDataAgent
+from response import ResponseComposer
+from safety import InputNormalizer, SafeRefusalBuilder, SafetyGate
+from triage import TriageAgent
+from validator import OutputValidator
+from workflow import WorkflowEngine
 
 
-def _empty_evidence_note(message: str) -> dict:
-    """Return evidence in the same shape as the retriever and data agent."""
-    return {"passages": [], "answer": "", "facts": [], "data_used": [], "notes": message}
+class CopilotOrchestrator:
+    """Coordinates copilot components following SOLID principles."""
 
+    def __init__(
+        self,
+        normalizer: InputNormalizer | None = None,
+        safety_gate: SafetyGate | None = None,
+        triage_agent: TriageAgent | None = None,
+        evidence_router: EvidenceRouter | None = None,
+        knowledge_agent: KnowledgeAgent | None = None,
+        data_agent: RetailDataAgent | None = None,
+        workflow_engine: WorkflowEngine | None = None,
+        response_composer: ResponseComposer | None = None,
+        output_validator: OutputValidator | None = None,
+    ):
+        self.normalizer = normalizer or InputNormalizer()
+        self.safety_gate = safety_gate or SafetyGate(self.normalizer)
+        self.triage_agent = triage_agent or TriageAgent()
+        self.evidence_router = evidence_router or EvidenceRouter()
+        self.knowledge_agent = knowledge_agent or KnowledgeAgent()
+        self.data_agent = data_agent or RetailDataAgent()
+        self.workflow_engine = workflow_engine or WorkflowEngine()
+        self.response_composer = response_composer or ResponseComposer()
+        self.output_validator = output_validator or OutputValidator()
 
-def _needs_business_data(question: str) -> bool:
-    """Use CSVs only for questions that appear to ask for business facts."""
-    data_terms = (
-        "how many", "count", "quantity", "stock", "inventory", "on hand",
-        "available", "stock-out", "stockout", "receipt", "shipment", "vendor",
-        "supplier", "support case", "recent case", "last 24 hours", "complaint",
-        "quality issue", "sku", "product", "store",
-    )
-    lowered_question = question.casefold()
-    return any(term in lowered_question for term in data_terms)
+    def process(self, question: str, test_id: str = "") -> dict[str, Any]:
+        """Execute the copilot dataflow pipeline from start to end."""
+        safe_test_id = test_id if isinstance(test_id, str) else ""
 
-
-def _safe_fallback_record(test_id: str, message: str, safety: dict | None = None) -> dict:
-    """Build the required prediction fields if a later module cannot run."""
-    safety = safety if isinstance(safety, dict) else {}
-    refused = safety.get("safety_refusal") == "Yes" or safety.get("security_escalation") == "Yes"
-    masked = safety.get("pii_masked") == "Yes"
-    return {
-        "test_id": test_id,
-        "category": "Other or Security",
-        "priority": "P1" if refused else "P4",
-        "confidence": 0.0,
-        "answer": (
-            safety.get("refusal_message")
-            if refused and isinstance(safety.get("refusal_message"), str)
-            else message
-        ),
-        "citations": "",
-        "data_used": "",
-        "escalated": "Yes" if refused or message else "No",
-        "escalation_team": "Security" if refused else "",
-        "pii_masked": "Yes" if masked else "No",
-        "safety_refusal": "Yes" if refused else "No",
-        "notes": "Request was not processed further." if refused else message,
-    }
-
-
-def _valid_triage(result: Any) -> bool:
-    """Check that triage returned labels and a usable confidence score."""
-    if not isinstance(result, dict):
-        return False
-    confidence = result.get("confidence")
-    return (
-        result.get("category") in CATEGORIES
-        and result.get("priority") in PRIORITIES
-        and isinstance(confidence, (int, float))
-        and not isinstance(confidence, bool)
-        and 0 <= confidence <= 1
-    )
-
-
-def run_copilot(question: str, test_id: str = "") -> dict:
-    """Run safety, triage, evidence, routing, and response in that order.
-
-    The orchestrator screens the raw question once; every later module receives
-    only the cleaned text and existing safety result. Errors are converted into
-    short, safe fallbacks; exception details and question text are never returned.
-    """
-    safe_test_id = test_id if isinstance(test_id, str) else ""
-
-    # Safety is deliberately imported and called before any LLM-backed module.
-    try:
-        from safety import check_request
-
-        safety = check_request(question if isinstance(question, str) else "")
-    except Exception:
-        return _safe_fallback_record(
-            safe_test_id,
-            "Safety screening is unavailable, so this request was not processed.",
-        )
-
-    if not isinstance(safety, dict):
-        return _safe_fallback_record(
-            safe_test_id,
-            "Safety screening returned an invalid result, so this request was not processed.",
-        )
-
-    safe_question = safety.get("cleaned_text", "")
-    if not isinstance(safe_question, str):
-        safe_question = ""
-
-    # Do not call triage, policy retrieval, or the data agent for refused input.
-    if safety.get("allowed") is not True or safety.get("safety_refusal") == "Yes":
-        triage = {
-            "category": "Other or Security",
-            "priority": "P1",
-            "confidence": 1.0,
-            "rationale": "Safety screening requires refusal and security review.",
-            "needs_human_review": True,
-        }
-        policy = {"passages": []}
-        data = {"answer": "", "facts": [], "data_used": [], "notes": ""}
+        # Step 1 & 2 & 3: Input Normalization & Safety Gate (ONLY place doing safety check!)
         try:
-            from workflow import route_case
-            from response import build_response
-
-            routing = route_case(triage, safety, safe_question)
-            result = build_response(triage, policy, data, routing, safety)
-            return {"test_id": safe_test_id, **result}
+            safety_result = self.safety_gate.evaluate(question)
         except Exception:
-            return _safe_fallback_record(
-                safe_test_id,
-                "I can’t provide restricted information. Use an approved, access-controlled process.",
-                safety,
+            safety_result = {
+                "allowed": False,
+                "is_safe": False,
+                "cleaned_text": "Safety screening is unavailable.",
+                "pii_masked": "No",
+                "safety_refusal": "Yes",
+                "security_escalation": "No",
+                "refusal_message": "Safety screening is temporarily unavailable, so this request was not processed.",
+                "reason": "Safety screening error; blocked for security.",
+            }
+
+        # Branch: Unsafe / restricted -> Safe refusal + security escalation -> Output Validator
+        if not safety_result.get("is_safe") or safety_result.get("safety_refusal") == "Yes":
+            refusal_record = SafeRefusalBuilder.build(safety_result, test_id=safe_test_id)
+            return self.output_validator.validate(refusal_record, test_id=safe_test_id)
+
+        # Branch: Safe -> Triage Agent
+        safe_question = safety_result.get("cleaned_text", "")
+        try:
+            triage = self.triage_agent.classify(safe_question)
+            if not isinstance(triage, dict):
+                raise ValueError("Invalid triage output")
+        except Exception:
+            triage = {
+                "category": "Other or Security",
+                "priority": "P4",
+                "confidence": 0.0,
+                "rationale": "Triage was unavailable; human review is required.",
+                "needs_human_review": True,
+                "review_reason": "Triage error or invalid result.",
+            }
+
+        category = triage.get("category", "Other or Security")
+
+        # Step 4 & 5: What evidence is needed? (Policy, Business data, or Both)
+        evidence_needed = self.evidence_router.determine_evidence_needed(category, safe_question)
+
+        policy_evidence = {"passages": [], "notes": ""}
+        data_evidence = {"answer": "", "facts": [], "data_used": [], "notes": ""}
+
+        # Route to Knowledge / RAG Agent if needed
+        if evidence_needed in {"policy", "both"}:
+            try:
+                policy_evidence = self.knowledge_agent.search(safe_question, category=category, top_k=3)
+                if not isinstance(policy_evidence, dict):
+                    policy_evidence = {"passages": [], "notes": "Policy retrieval returned an invalid result."}
+            except Exception:
+                policy_evidence = {"passages": [], "notes": "Policy files or retrieval service were unavailable."}
+
+        # Route to Retail Data Agent if needed
+        if evidence_needed in {"business_data", "both"}:
+            try:
+                data_evidence = self.data_agent.query(safe_question)
+                if not isinstance(data_evidence, dict):
+                    data_evidence = {
+                        "answer": "",
+                        "facts": [],
+                        "data_used": [],
+                        "notes": "Data agent returned an invalid result.",
+                    }
+            except Exception:
+                data_evidence = {
+                    "answer": "",
+                    "facts": [],
+                    "data_used": [],
+                    "notes": "Business data files or query service were unavailable.",
+                }
+
+        # Surface policy notes into data notes if present
+        policy_note = policy_evidence.get("notes", "")
+        if isinstance(policy_note, str) and policy_note.strip():
+            existing_note = data_evidence.get("notes", "")
+            data_evidence["notes"] = " ".join(
+                p for p in (existing_note, policy_note.strip()) if isinstance(p, str) and p.strip()
             )
 
-    # Triage can fail because an LLM service is unavailable or its JSON is invalid.
-    try:
-        from triage import _classify_screened_request
+        # Step 6: Evidence Bundle
+        evidence_bundle = EvidenceBundle(
+            question=safe_question,
+            category=category,
+            priority=triage.get("priority", "P4"),
+            confidence=float(triage.get("confidence", 0.0)),
+            rationale=triage.get("rationale", ""),
+            policy=policy_evidence,
+            data=data_evidence,
+        )
 
-        triage = _classify_screened_request(safety)
-    except Exception:
-        triage = None
-
-    if not _valid_triage(triage):
-        triage = {
-            "category": "Other or Security",
-            "priority": "P4",
-            "confidence": 0.0,
-            "rationale": "Triage was unavailable or returned invalid labels; human review is needed.",
-            "needs_human_review": True,
-            "review_reason": "Triage error or invalid result.",
-        }
-
-    # Policy evidence is useful for most employee questions. An empty result is
-    # valid; retrieval failures simply leave the answer without policy citations.
-    try:
-        from knowledge_retriever import search_policy
-
-        policy = search_policy(safe_question, category=triage["category"], top_k=3)
-        if not isinstance(policy, dict) or not isinstance(policy.get("passages", []), list):
-            policy = _empty_evidence_note("Policy retrieval returned an invalid result.")
-        else:
-            policy.setdefault("passages", [])
-    except Exception:
-        policy = _empty_evidence_note("Policy files or retrieval service were unavailable.")
-
-    # Only query the CSV agent when the question appears to ask for store data.
-    if _needs_business_data(safe_question):
+        # Step 7: Workflow & Escalation Engine
         try:
-            from data_agent import _answer_screened_data_question
-
-            data = _answer_screened_data_question(safety)
-            if not isinstance(data, dict):
-                data = {"answer": "", "facts": [], "data_used": [], "notes": "The data agent returned an invalid result."}
-            data.setdefault("answer", "")
-            data.setdefault("facts", [])
-            data.setdefault("data_used", [])
-            data.setdefault("notes", "")
+            routing = self.workflow_engine.route(triage, question=safe_question, safety=safety_result)
+            if not isinstance(routing, dict):
+                raise ValueError("Invalid workflow result")
         except Exception:
-            data = {"answer": "", "facts": [], "data_used": [], "notes": "Business data files or query service were unavailable."}
-    else:
-        data = {"answer": "", "facts": [], "data_used": [], "notes": ""}
+            routing = {
+                "escalated": "Yes",
+                "escalation_team": "",
+                "channel": "",
+                "sla_minutes": None,
+                "human_approval_required": "Yes",
+                "needs_human_review": True,
+                "route_found": False,
+                "reason": "Workflow routing failed; human review required.",
+                "category": category,
+                "priority": triage.get("priority", "P4"),
+            }
 
-    # The response builder surfaces data notes, so include a safe retrieval
-    # status there instead of silently hiding a policy-index failure.
-    policy_note = policy.get("notes", "") if isinstance(policy, dict) else ""
-    if isinstance(policy_note, str) and policy_note.strip():
-        existing_note = data.get("notes", "")
-        data["notes"] = " ".join(
-            part for part in (existing_note, policy_note.strip()) if isinstance(part, str) and part.strip()
-        )
+        # Step 8: Response Composer
+        try:
+            raw_response = self.response_composer.compose(
+                triage=triage,
+                policy=policy_evidence,
+                data=data_evidence,
+                routing=routing,
+                safety=safety_result,
+            )
+        except Exception:
+            raw_response = {
+                "test_id": safe_test_id,
+                "category": category,
+                "priority": triage.get("priority", "P4"),
+                "confidence": float(triage.get("confidence", 0.0)),
+                "answer": "The request could not be completed safely. A human should review it.",
+                "citations": "",
+                "data_used": "",
+                "escalated": "Yes",
+                "escalation_team": "",
+                "pii_masked": safety_result.get("pii_masked", "No"),
+                "safety_refusal": "No",
+                "notes": "Response composition error.",
+            }
 
-    # Workflow adds deterministic impact and approval rules to model triage.
-    try:
-        from workflow import route_case
+        # Step 9 & 10: Output Validator -> UI Display / predictions.csv
+        validated_result = self.output_validator.validate(raw_response, test_id=safe_test_id)
+        return validated_result
 
-        routing = route_case(triage, safety, safe_question)
-        if not isinstance(routing, dict):
-            raise ValueError("Invalid workflow result")
-    except Exception:
-        routing = {
-            "escalated": "Yes",
-            "escalation_team": "",
-            "channel": "",
-            "sla_minutes": None,
-            "human_approval_required": "Yes",
-            "needs_human_review": True,
-            "route_found": False,
-            "reason": "Workflow or escalation data was unavailable; routing information is unavailable.",
-            "category": triage["category"],
-            "priority": triage["priority"],
-        }
 
-    # Response creation validates labels and citations. If that validation fails,
-    # return a safe schema-shaped fallback instead of leaking exception details.
-    try:
-        from response import build_response
+# Global default instance
+_orchestrator = CopilotOrchestrator()
 
-        response = build_response(triage, policy, data, routing, safety)
-        if not isinstance(response, dict):
-            raise ValueError("Invalid response result")
-        return {"test_id": safe_test_id, **response}
-    except Exception:
-        return _safe_fallback_record(
-            safe_test_id,
-            "The request could not be completed safely. A human should review it.",
-            safety,
-        )
+
+def run_copilot(question: str, test_id: str = "") -> dict[str, Any]:
+    """Primary pipeline runner matching evaluation and app expectations."""
+    return _orchestrator.process(question, test_id=test_id)
+
+
+def process_question(question: str, test_id: str = "") -> dict[str, Any]:
+    """Alias requested for Streamlit and evaluation runners."""
+    return _orchestrator.process(question, test_id=test_id)
+

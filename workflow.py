@@ -45,128 +45,140 @@ def _best_matrix_route(category: str, priority: str, matrix: pd.DataFrame) -> pd
     return candidates.iloc[0]
 
 
-def route_case(triage: dict, safety: dict, question: str = "") -> dict:
-    """Select an escalation route and human-review flags from fixed rules.
+class WorkflowEngine:
+    """Workflow & Escalation Engine.
 
-    The optional question supports deterministic impact checks. It should be
-    the safety-screened text when available. This function only recommends a
-    route; it never submits a ticket or performs a store action.
+    Evaluates category, priority, and question context against escalation matrix
+    and deterministic store operational rules.
     """
-    if not MATRIX_PATH.is_file():
+
+    def __init__(self, matrix_path: Path = MATRIX_PATH):
+        self.matrix_path = matrix_path
+
+    def route(self, triage: dict, question: str = "", safety: dict | None = None) -> dict:
+        """Select an escalation route and human-review flags from fixed rules."""
+        if not self.matrix_path.is_file():
+            return {
+                "escalated": "Yes",
+                "escalation_team": "",
+                "channel": "",
+                "sla_minutes": None,
+                "human_approval_required": "Yes",
+                "needs_human_review": True,
+                "route_found": False,
+                "reason": "Escalation matrix is unavailable; routing information is unavailable and a human must review.",
+                "category": triage.get("category", "Other or Security"),
+                "priority": triage.get("priority", "P4"),
+            }
+
+        matrix = pd.read_csv(self.matrix_path, dtype=str, keep_default_na=False)
+        category = triage.get("category", "Other or Security")
+        priority = triage.get("priority", "P4")
+        confidence = pd.to_numeric(triage.get("confidence"), errors="coerce")
+        safety_dict = safety if isinstance(safety, dict) else {}
+        request_text = (safety_dict.get("cleaned_text") or question or "").casefold()
+
+        safety_refusal = _is_yes(safety_dict.get("safety_refusal"))
+        security_escalation = _is_yes(safety_dict.get("security_escalation"))
+        approval_required = False
+        impact_reason = ""
+
+        # Sensitive-data requests always take the Security route, even when model
+        # triage chose a different category.
+        if safety_refusal or security_escalation:
+            category = "Other or Security"
+            priority = "P1"
+            approval_required = True
+            impact_reason = "Safety screening requires a Security review."
+
+        # Raise payment outages and immediate safety risks above the model's choice.
+        elif URGENT_SAFETY_PATTERN.search(request_text):
+            category = "Product Quality and Safety"
+            priority = "P1"
+            approval_required = True
+            impact_reason = "A safety risk requires immediate human review."
+        elif BROAD_PAYMENT_PATTERN.search(request_text):
+            category = "POS and Payments"
+            priority = "P1"
+            approval_required = True
+            impact_reason = "Broad register or payment impact requires immediate human escalation."
+        elif category == "Pricing and Promotions" and BROAD_PRICING_PATTERN.search(request_text):
+            priority = "P2" if PRIORITY_RANK.get(priority, 4) > PRIORITY_RANK["P2"] else priority
+            approval_required = True
+            impact_reason = "A broad pricing mismatch requires manager and pricing-team review."
+
+        # Policy flags approval-required actions, including returns, vendor claims,
+        # product quarantine, and all matrix routes marked for human approval.
+        if category == "Returns and Refunds" and re.search(
+            r"no[- ]receipt|without receipt|refund.{0,30}(?:inr|rs\.?|₹)?\s*\d{4,}|(?:inr|rs\.?|₹)\s*\d{4,}",
+            request_text,
+        ):
+            approval_required = True
+            if PRIORITY_RANK.get(priority, 4) > PRIORITY_RANK["P2"]:
+                priority = "P2"
+            impact_reason = impact_reason or "Return policy requires manager approval for this request."
+
+        matrix_route = _best_matrix_route(category, priority, matrix)
+        if matrix_route is None:
+            return {
+                "escalated": "Yes",
+                "escalation_team": "",
+                "channel": "",
+                "sla_minutes": None,
+                "human_approval_required": "Yes",
+                "needs_human_review": True,
+                "route_found": False,
+                "reason": (
+                    f"No escalation-matrix route matches {category} {priority}; "
+                    "routing information is unavailable and a human must review."
+                ),
+                "category": category,
+                "priority": priority,
+            }
+
+        route_requires_approval = _is_yes(matrix_route["human_approval_required"])
+        low_confidence = pd.notna(confidence) and confidence < 0.60
+        triage_review = _is_yes(triage.get("needs_human_review"))
+        priority_one = priority == "P1"
+        human_review = (
+            safety_refusal
+            or security_escalation
+            or approval_required
+            or route_requires_approval
+            or low_confidence
+            or triage_review
+            or priority_one
+        )
+
+        reason_parts = []
+        if impact_reason:
+            reason_parts.append(impact_reason)
+        elif low_confidence:
+            reason_parts.append("Model confidence is below 0.60; a human should verify the classification.")
+        elif route_requires_approval:
+            reason_parts.append("The escalation matrix requires human approval for this route.")
+        elif priority_one:
+            reason_parts.append("P1 requires immediate human escalation.")
+        else:
+            reason_parts.append(f"Route selected for: {matrix_route['trigger']}.")
+
         return {
-            "escalated": "Yes",
-            "escalation_team": "",
-            "channel": "",
-            "sla_minutes": None,
-            "human_approval_required": "Yes",
-            "needs_human_review": True,
-            "route_found": False,
-            "reason": "Escalation matrix is unavailable; routing information is unavailable and a human must review.",
-            "category": triage.get("category", "Other or Security"),
-            "priority": triage.get("priority", "P4"),
-        }
-
-    matrix = pd.read_csv(MATRIX_PATH, dtype=str, keep_default_na=False)
-    category = triage.get("category", "Other or Security")
-    priority = triage.get("priority", "P4")
-    confidence = pd.to_numeric(triage.get("confidence"), errors="coerce")
-    request_text = (safety.get("cleaned_text") or question or "").casefold()
-
-    safety_refusal = _is_yes(safety.get("safety_refusal"))
-    security_escalation = _is_yes(safety.get("security_escalation"))
-    approval_required = False
-    impact_reason = ""
-
-    # Sensitive-data requests always take the Security route, even when model
-    # triage chose a different category.
-    if safety_refusal or security_escalation:
-        category = "Other or Security"
-        priority = "P1"
-        approval_required = True
-        impact_reason = "Safety screening requires a Security review."
-
-    # Raise payment outages and immediate safety risks above the model's choice.
-    elif URGENT_SAFETY_PATTERN.search(request_text):
-        category = "Product Quality and Safety"
-        priority = "P1"
-        approval_required = True
-        impact_reason = "A safety risk requires immediate human review."
-    elif BROAD_PAYMENT_PATTERN.search(request_text):
-        category = "POS and Payments"
-        priority = "P1"
-        approval_required = True
-        impact_reason = "Broad register or payment impact requires immediate human escalation."
-    elif category == "Pricing and Promotions" and BROAD_PRICING_PATTERN.search(request_text):
-        priority = "P2" if PRIORITY_RANK.get(priority, 4) > PRIORITY_RANK["P2"] else priority
-        approval_required = True
-        impact_reason = "A broad pricing mismatch requires manager and pricing-team review."
-
-    # Policy flags approval-required actions, including returns, vendor claims,
-    # product quarantine, and all matrix routes marked for human approval.
-    if category == "Returns and Refunds" and re.search(
-        r"no[- ]receipt|without receipt|refund.{0,30}(?:inr|rs\.?|₹)?\s*\d{4,}|(?:inr|rs\.?|₹)\s*\d{4,}",
-        request_text,
-    ):
-        approval_required = True
-        if PRIORITY_RANK.get(priority, 4) > PRIORITY_RANK["P2"]:
-            priority = "P2"
-        impact_reason = impact_reason or "Return policy requires manager approval for this request."
-
-    matrix_route = _best_matrix_route(category, priority, matrix)
-    if matrix_route is None:
-        return {
-            "escalated": "Yes",
-            "escalation_team": "",
-            "channel": "",
-            "sla_minutes": None,
-            "human_approval_required": "Yes",
-            "needs_human_review": True,
-            "route_found": False,
-            "reason": (
-                f"No escalation-matrix route matches {category} {priority}; "
-                "routing information is unavailable and a human must review."
-            ),
+            "escalated": "Yes" if human_review else "No",
+            "escalation_team": matrix_route["team"],
+            "channel": matrix_route["channel"],
+            "sla_minutes": int(matrix_route["sla_minutes"]),
+            "human_approval_required": "Yes" if route_requires_approval or approval_required else "No",
+            "needs_human_review": bool(human_review),
+            "route_found": True,
+            "reason": " ".join(reason_parts),
             "category": category,
             "priority": priority,
         }
 
-    route_requires_approval = _is_yes(matrix_route["human_approval_required"])
-    low_confidence = pd.notna(confidence) and confidence < 0.60
-    triage_review = _is_yes(triage.get("needs_human_review"))
-    priority_one = priority == "P1"
-    human_review = (
-        safety_refusal
-        or security_escalation
-        or approval_required
-        or route_requires_approval
-        or low_confidence
-        or triage_review
-        or priority_one
-    )
 
-    reason_parts = []
-    if impact_reason:
-        reason_parts.append(impact_reason)
-    elif low_confidence:
-        reason_parts.append("Model confidence is below 0.60; a human should verify the classification.")
-    elif route_requires_approval:
-        reason_parts.append("The escalation matrix requires human approval for this route.")
-    elif priority_one:
-        reason_parts.append("P1 requires immediate human escalation.")
-    else:
-        reason_parts.append(f"Route selected for: {matrix_route['trigger']}.")
+def route_case(triage: dict, safety: dict | None = None, question: str = "") -> dict:
+    """Compatibility entry point delegating to WorkflowEngine."""
+    safety_dict = safety if isinstance(safety, dict) else {}
+    req_question = question or safety_dict.get("cleaned_text", "")
+    return WorkflowEngine().route(triage, question=req_question, safety=safety_dict)
 
-    return {
-        # A routine matrix destination is a suggested queue, not automatically
-        # an escalation. Escalate only when the deterministic review rules fire.
-        "escalated": "Yes" if human_review else "No",
-        "escalation_team": matrix_route["team"],
-        "channel": matrix_route["channel"],
-        "sla_minutes": int(matrix_route["sla_minutes"]),
-        "human_approval_required": "Yes" if route_requires_approval or approval_required else "No",
-        "needs_human_review": bool(human_review),
-        "route_found": True,
-        "reason": " ".join(reason_parts),
-        "category": category,
-        "priority": priority,
-    }

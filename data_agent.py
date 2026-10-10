@@ -9,7 +9,6 @@ import pandas as pd
 from llm_client import chat_completion
 from diagnostics import log_failure
 from labels_and_citations import PRIORITIES
-from safety import check_request
 
 
 DATA_DIR = Path(__file__).resolve().parent / "data"
@@ -438,69 +437,75 @@ def _quality_complaints_answer(filters: dict, by_vendor: bool) -> dict:
     return {"answer": answer, "facts": facts, "data_used": data_used, "notes": notes}
 
 
-def answer_data_question(question: str) -> dict:
-    """Use an allowlisted intent to select a pandas calculation over local CSVs.
+class RetailDataAgent:
+    """Retail data agent performing pandas analysis over local CSVs.
 
-    Direct callers are screened here. The orchestrator uses the private
-    screened-text entry point after it performs the request's single screening
-    pass. Only cleaned text is used downstream.
+    Adheres to Single Responsibility Principle: executes data analytics only.
+    Safety screening is handled exclusively by the SafetyGate.
     """
-    return _answer_screened_data_question(check_request(question or ""))
+
+    def query(self, question: str) -> dict:
+        """Run allowlisted intent extraction and pandas computation on CSVs."""
+        safe_text = question.strip() if isinstance(question, str) else ""
+        if not safe_text:
+            return _empty_result("No question provided.", "Empty input to data agent.")
+
+        try:
+            filters = _extract_query(safe_text)
+        except Exception as error:
+            log_failure("data_agent.intent_generation", error)
+            return _empty_result(
+                "I could not safely identify a supported data query.",
+                "The intent response was unavailable or invalid, so no generated query was run and no CSV was analyzed.",
+            )
+
+        intent = filters["intent"]
+        if intent == "unsupported":
+            return _empty_result(
+                "The supplied CSV files do not support this question as a data lookup.",
+                "No approved query intent matched the request.",
+            )
+
+        try:
+            if intent in {"inventory_lookup", "stockout_root_cause"}:
+                return _inventory_answer(filters)
+            if intent == "recent_support_cases":
+                return _support_cases_answer(filters)
+            if intent == "quality_complaints_by_vendor":
+                return _quality_complaints_answer(filters, by_vendor=True)
+            if intent == "product_quality_by_sku":
+                return _quality_complaints_answer(filters, by_vendor=False)
+        except (FileNotFoundError, pd.errors.EmptyDataError, pd.errors.ParserError) as error:
+            log_failure("data_agent.query", error)
+            return _empty_result(
+                "I could not complete the data lookup because a required CSV file is unavailable or unreadable.",
+                "Check the supplied files under data/ and try again.",
+            )
+        except (KeyError, ValueError, TypeError) as error:
+            log_failure("data_agent.query", error)
+            return _empty_result(
+                "I could not safely calculate an answer from the supplied data.",
+                "A required field or value was missing or could not be interpreted.",
+            )
+        except Exception as error:
+            log_failure("data_agent.query", error)
+            raise
+
+        return _empty_result("No data result was produced.", "The selected intent has no implementation.")
 
 
-def _answer_screened_data_question(safety_result: dict) -> dict:
-    """Run the data agent using trusted output from safety.check_request."""
-    if (
-        not isinstance(safety_result, dict)
-        or safety_result.get("allowed") is not True
-        or safety_result.get("safety_refusal") == "Yes"
-        or not isinstance(safety_result.get("cleaned_text"), str)
-    ):
-        return _empty_result(
-            "I can’t help retrieve or expose restricted information.",
-            "The request was refused by the safety check and was not sent to the model or CSV analysis.",
-        )
+def answer_data_question(question: str) -> dict:
+    """Top-level entry point delegating directly to RetailDataAgent."""
+    return RetailDataAgent().query(question)
 
-    try:
-        filters = _extract_query(safety_result["cleaned_text"])
-    except Exception as error:
-        log_failure("data_agent.intent_generation", error)
-        return _empty_result(
-            "I could not safely identify a supported data query.",
-            "The intent response was unavailable or invalid, so no generated query was run and no CSV was analyzed.",
-        )
 
-    intent = filters["intent"]
-    if intent == "unsupported":
-        return _empty_result(
-            "The supplied CSV files do not support this question as a data lookup.",
-            "No approved query intent matched the request.",
-        )
+def _answer_screened_data_question(screened_input: object) -> dict:
+    """Compatibility entry point accepting either a text string or dictionary."""
+    if isinstance(screened_input, dict):
+        text = screened_input.get("cleaned_text") or screened_input.get("question") or ""
+    elif isinstance(screened_input, str):
+        text = screened_input
+    else:
+        text = ""
+    return answer_data_question(text)
 
-    try:
-        if intent in {"inventory_lookup", "stockout_root_cause"}:
-            return _inventory_answer(filters)
-        if intent == "recent_support_cases":
-            return _support_cases_answer(filters)
-        if intent == "quality_complaints_by_vendor":
-            return _quality_complaints_answer(filters, by_vendor=True)
-        if intent == "product_quality_by_sku":
-            return _quality_complaints_answer(filters, by_vendor=False)
-    except (FileNotFoundError, pd.errors.EmptyDataError, pd.errors.ParserError) as error:
-        log_failure("data_agent.query", error)
-        return _empty_result(
-            "I could not complete the data lookup because a required CSV file is unavailable or unreadable.",
-            "Check the supplied files under data/ and try again.",
-        )
-    except (KeyError, ValueError, TypeError) as error:
-        log_failure("data_agent.query", error)
-        return _empty_result(
-            "I could not safely calculate an answer from the supplied data.",
-            "A required field or value was missing or could not be interpreted.",
-        )
-    except Exception as error:
-        # Keep propagation intact for the orchestrator's existing fallback.
-        log_failure("data_agent.query", error)
-        raise
-
-    return _empty_result("No data result was produced.", "The selected intent has no implementation.")

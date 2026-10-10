@@ -4,7 +4,6 @@ import re
 from pathlib import Path
 
 from labels_and_citations import CATEGORIES, PRIORITIES, citations_for_markdown
-from safety import mask_sensitive_data
 
 
 ROOT_DIR = Path(__file__).resolve().parent
@@ -36,12 +35,10 @@ def _valid_citation(citation: str) -> bool:
 
 
 def _safe_text(value: object) -> str:
-    """Normalize text and mask any recognizable personal/payment information."""
+    """Normalize text whitespace cleanly without redundant screening."""
     if not isinstance(value, str):
         return ""
-    normalized = " ".join(value.split())
-    masked, _ = mask_sensitive_data(normalized)
-    return masked
+    return " ".join(value.split())
 
 
 def _first_policy_sentence(passage: dict) -> str:
@@ -101,19 +98,46 @@ def _validate_inputs(triage: dict, policy: dict, data: dict, routing: dict, safe
     return float(confidence), category, priority
 
 
+class ResponseComposer:
+    """Composes grounded responses and prediction-schema records from evidence."""
+
+    def compose(
+        self,
+        triage: dict,
+        policy: dict,
+        data: dict,
+        routing: dict,
+        safety: dict | None = None,
+    ) -> dict:
+        """Compose answer and schema fields from triage, evidence, and routing."""
+        safety_dict = safety if isinstance(safety, dict) else {
+            "pii_masked": "No",
+            "safety_refusal": "No",
+            "security_escalation": "No",
+            "refusal_message": "",
+        }
+        return _build_response_internal(triage, policy, data, routing, safety_dict)
+
+
 def build_response(
+    triage: dict,
+    policy: dict,
+    data: dict,
+    routing: dict,
+    safety: dict | None = None,
+) -> dict:
+    """Build a grounded answer and prediction-schema fields without generation."""
+    return ResponseComposer().compose(triage, policy, data, routing, safety)
+
+
+def _build_response_internal(
     triage: dict,
     policy: dict,
     data: dict,
     routing: dict,
     safety: dict,
 ) -> dict:
-    """Build a grounded answer and prediction-schema fields without generation.
 
-    Only validated category/priority labels, stored policy citations, and
-    locally calculated data results are used. The function recommends actions
-    but never claims a refund, inventory update, or vendor action was completed.
-    """
     confidence, category, priority = _validate_inputs(triage, policy, data, routing, safety)
     routed_category = routing.get("category", category)
     routed_priority = routing.get("priority", priority)
